@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+BP_BIN="$ROOT_DIR/bp"
+[[ -x "$BP_BIN" ]] || { echo "bp-menu: missing executable: $BP_BIN" >&2; exit 2; }
+
+COLOR_MODE="${BP_COLOR:-always}"   # always|never|auto (menu defaults always)
+STREAM_MODE="${BP_STREAM:-always}" # always|never|auto (menu defaults always)
+
+run_bp() {
+  local stage="$1"
+
+  stream_flag=()
+  case "$STREAM_MODE" in
+    always) stream_flag=(--stream) ;;
+    never) stream_flag=(--no-stream) ;;
+    auto) stream_flag=() ;;
+    *) echo "bp-menu: invalid BP_STREAM=$STREAM_MODE" >&2; return 2 ;;
+  esac
+
+  "$BP_BIN" "$stage" --color "$COLOR_MODE" "${stream_flag[@]}"
+}
+
+pick_with_gum() {
+  gum choose \
+    "Run: check" \
+    "Run: test" \
+    "Run: cli" \
+    "Run: e2e" \
+    "Toggle color (currently: $COLOR_MODE)" \
+    "Toggle stream (currently: $STREAM_MODE)" \
+    "Quit"
+}
+
+pick_with_select() {
+  echo ""
+  echo "Pick:"
+  options=(
+    "Run: check"
+    "Run: test"
+    "Run: cli"
+    "Run: e2e"
+    "Toggle color (currently: $COLOR_MODE)"
+    "Toggle stream (currently: $STREAM_MODE)"
+    "Quit"
+  )
+  select opt in "${options[@]}"; do
+    [[ -n "${opt:-}" ]] || { echo "invalid selection" >&2; continue; }
+    echo "$opt"
+    return 0
+  done
+}
+
+while true; do
+  if command -v gum >/dev/null 2>&1; then
+    CHOICE="$(pick_with_gum || true)"
+  else
+    CHOICE="$(pick_with_select)"
+  fi
+
+  case "$CHOICE" in
+    "Run: check") run_bp check ;;
+    "Run: test") run_bp test ;;
+    "Run: cli") run_bp cli ;;
+    "Run: e2e") run_bp e2e ;;
+    Toggle\ color*)
+      if [[ "$COLOR_MODE" == "never" ]]; then COLOR_MODE="always"; else COLOR_MODE="never"; fi
+      ;;
+    Toggle\ stream*)
+      if [[ "$STREAM_MODE" == "never" ]]; then STREAM_MODE="always"; else STREAM_MODE="never"; fi
+      ;;
+    "Quit"|"") exit 0 ;;
+    *) echo "bp-menu: unknown choice: $CHOICE" >&2 ;;
+  esac
+done

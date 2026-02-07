@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "stages": {
+    "check": ["cli_example"],
+    "test": [],
+    "cli": ["cli_example"],
+    "e2e": []
+  },
+  "tasks": {
+    "cli_example": {
+      "desc": "example CLI: node JSON contract",
+      "cmd": ["node", "examples/node/example_cli.js", "--json", "--stable", "--seed", "0"],
+      "timeout_ms": 10000,
+      "expects": {
+        "stdout": "json",
+        "jq": "examples/node/contracts/example.jq",
+        "golden": "examples/node/contracts/goldens/example.json"
+      }
+    }
+  }
+}

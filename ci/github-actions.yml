@@ -1,0 +1,24 @@
+name: bp
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  bp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      # Repo-specific toolchains belong here (node/python/go/rust/etc).
+
+      - name: bp check
+        run: ./bp check --color never --no-stream
+
+      - name: bp cli
+        run: ./bp cli --color never --no-stream

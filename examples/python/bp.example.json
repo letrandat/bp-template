@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "stages": {
+    "check": ["cli_example"],
+    "test": [],
+    "cli": ["cli_example"],
+    "e2e": []
+  },
+  "tasks": {
+    "cli_example": {
+      "desc": "example CLI: python JSON contract",
+      "cmd": ["python3", "examples/python/example_cli.py", "--json", "--stable", "--seed", "0"],
+      "timeout_ms": 10000,
+      "expects": {
+        "stdout": "json",
+        "jq": "examples/python/contracts/example.jq",
+        "golden": "examples/python/contracts/goldens/example.json"
+      }
+    }
+  }
+}

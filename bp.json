@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "stages": {
+    "check": ["todo_configure"],
+    "test": ["todo_configure"],
+    "cli": ["todo_configure"],
+    "e2e": ["todo_configure"]
+  },
+  "tasks": {
+    "todo_configure": {
+      "desc": "TODO: edit bp.json and wire real repo commands",
+      "cmd": ["bash", "-lc", "echo 'bp: edit bp.json and wire real tasks' >&2; exit 2"],
+      "timeout_ms": 10000
+    }
+  }
+}

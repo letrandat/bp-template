@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
+usage() {
+  cat >&2 <<'EOF'
+bp: backpressure runner
+
+usage:
+  ./bp <check|test|cli|e2e> [flags]
+
+flags:
+  --config <path>         default: ./bp.json
+  --color <auto|always|never>
+  --stream                force stream task output (interactive)
+  --no-stream             force capture task output (non-interactive)
+  --json-report           emit JSON report to stdout
+  --task <id>             run only one task (must be in the stage list)
+  -h, --help
+EOF
+}
+
+die() { echo "bp: $*" >&2; exit 2; }
+
+CONFIG_PATH="${BP_CONFIG:-$ROOT_DIR/bp.json}"
+COLOR_MODE="${BP_COLOR:-auto}"
+STREAM_MODE="${BP_STREAM:-auto}" # auto|always|never
+JSON_REPORT=0
+ONLY_TASK=""
+STAGE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    check|test|cli|e2e)
+      STAGE="$1"
+      shift
+      ;;
+    --config)
+      [[ $# -ge 2 ]] || die "--config requires a value"
+      CONFIG_PATH="$2"
+      shift 2
+      ;;
+    --color)
+      [[ $# -ge 2 ]] || die "--color requires a value"
+      COLOR_MODE="$2"
+      shift 2
+      ;;
+    --color=*)
+      COLOR_MODE="${1#*=}"
+      shift
+      ;;
+    --stream)
+      STREAM_MODE="always"
+      shift
+      ;;
+    --no-stream)
+      STREAM_MODE="never"
+      shift
+      ;;
+    --json-report)
+      JSON_REPORT=1
+      shift
+      ;;
+    --task)
+      [[ $# -ge 2 ]] || die "--task requires a value"
+      ONLY_TASK="$2"
+      shift 2
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown arg: $1"
+      ;;
+  esac
+done
+
+[[ -n "$STAGE" ]] || { usage; exit 2; }
+
+command -v jq >/dev/null 2>&1 || die "missing dependency: jq"
+[[ -f "$CONFIG_PATH" ]] || die "missing config: $CONFIG_PATH"
+
+if ! jq -e '.version == 1' "$CONFIG_PATH" >/dev/null; then
+  die "bp.json: expected {\"version\": 1}"
+fi
+
+if ! jq -e --arg stage "$STAGE" '.stages[$stage] and (.stages[$stage] | type == "array")' "$CONFIG_PATH" >/dev/null; then
+  die "bp.json: missing stages.$STAGE (array of task ids)"
+fi
+
+is_tty_stderr() { [[ -t 2 ]] && [[ "${TERM:-}" != "dumb" ]]; }
+
+use_color=0
+case "$COLOR_MODE" in
+  always) use_color=1 ;;
+  never) use_color=0 ;;
+  auto)
+    if is_tty_stderr; then use_color=1; else use_color=0; fi
+    ;;
+  *) die "invalid --color: $COLOR_MODE" ;;
+esac
+
+stream="never"
+case "$STREAM_MODE" in
+  always) stream="always" ;;
+  never) stream="never" ;;
+  auto)
+    if is_tty_stderr; then stream="always"; else stream="never"; fi
+    ;;
+  *) die "invalid stream mode: $STREAM_MODE" ;;
+esac
+
+if [[ "$use_color" == "1" ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_BLUE=$'\033[34m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_RED=$'\033[31m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_BLUE=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_RED=""
+fi
+
+hdr() { echo "${C_BOLD}${C_BLUE}$*${C_RESET}" >&2; }
+ok() { echo "${C_GREEN}$*${C_RESET}" >&2; }
+warn() { echo "${C_YELLOW}$*${C_RESET}" >&2; }
+err() { echo "${C_RED}$*${C_RESET}" >&2; }
+
+timeout_prefix=()
+timeout_sec_from_ms() {
+  local ms="$1"
+  # ceil(ms/1000)
+  echo $(( (ms + 999) / 1000 ))
+}
+
+compute_timeout_prefix() {
+  local timeout_ms="$1"
+  timeout_prefix=()
+
+  [[ -n "$timeout_ms" ]] || return 0
+  [[ "$timeout_ms" != "null" ]] || return 0
+  [[ "$timeout_ms" =~ ^[0-9]+$ ]] || { warn "timeout_ms not int: $timeout_ms (ignoring)"; return 0; }
+
+  local sec
+  sec="$(timeout_sec_from_ms "$timeout_ms")"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_prefix=(timeout "${sec}s")
+  elif command -v gtimeout >/dev/null 2>&1; then
+    timeout_prefix=(gtimeout "${sec}s")
+  else
+    warn "timeout not available (install coreutils); running without timeout"
+  fi
+}
+
+require_relpath() {
+  local rel="$1"
+  local abs="$ROOT_DIR/$rel"
+  [[ -f "$abs" ]] || die "missing file: $rel"
+  echo "$abs"
+}
+
+STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+REPORT_OK=1
+REPORT_LINES=()
+
+TASK_IDS=()
+while IFS= read -r task_id; do
+  [[ -n "$task_id" ]] && TASK_IDS+=("$task_id")
+done < <(jq -r --arg stage "$STAGE" '.stages[$stage][]' "$CONFIG_PATH")
+
+if [[ -n "$ONLY_TASK" ]]; then
+  found=0
+  for t in "${TASK_IDS[@]}"; do
+    [[ "$t" == "$ONLY_TASK" ]] && found=1
+  done
+  [[ "$found" == "1" ]] || die "--task not in stage list: $ONLY_TASK"
+fi
+
+hdr "== bp $STAGE =="
+ok "config: ${CONFIG_PATH#"$ROOT_DIR"/}"
+ok "stream: $stream"
+
+run_task() {
+  local task_id="$1"
+
+  if ! jq -e --arg id "$task_id" '.tasks[$id]' "$CONFIG_PATH" >/dev/null; then
+    die "bp.json: missing tasks.$task_id"
+  fi
+
+  local desc cmd_sh timeout_ms expects_stdout expects_jq expects_golden
+  desc="$(jq -r --arg id "$task_id" '.tasks[$id].desc // $id' "$CONFIG_PATH")"
+  cmd_sh="$(jq -r --arg id "$task_id" '.tasks[$id].cmd | @sh' "$CONFIG_PATH")"
+  timeout_ms="$(jq -r --arg id "$task_id" '.tasks[$id].timeout_ms // empty' "$CONFIG_PATH")"
+  expects_stdout="$(jq -r --arg id "$task_id" '.tasks[$id].expects.stdout // empty' "$CONFIG_PATH")"
+  expects_jq="$(jq -r --arg id "$task_id" '.tasks[$id].expects.jq // empty' "$CONFIG_PATH")"
+  expects_golden="$(jq -r --arg id "$task_id" '.tasks[$id].expects.golden // empty' "$CONFIG_PATH")"
+
+  hdr ""
+  hdr "## $task_id"
+  echo "$desc" >&2
+
+  # Build argv from JSON array.
+  eval "set -- $cmd_sh"
+  local argv=("$@")
+
+  compute_timeout_prefix "$timeout_ms"
+
+  local tmpdir
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/bp.${STAGE}.${task_id}.XXXXXXXX")"
+  local stdout_file="$tmpdir/stdout"
+  local stderr_file="$tmpdir/stderr"
+
+  local rc=0
+
+  if [[ "$expects_stdout" == "json" ]]; then
+    if [[ "$stream" == "always" ]]; then
+      "${timeout_prefix[@]}" "${argv[@]}" >"$stdout_file" || rc=$?
+    else
+      "${timeout_prefix[@]}" "${argv[@]}" >"$stdout_file" 2>"$stderr_file" || rc=$?
+    fi
+
+    if [[ "$rc" != "0" ]]; then
+      err "FAIL $task_id (exit=$rc)"
+      err "cmd: ${argv[*]}"
+      if [[ -s "$stderr_file" ]]; then
+        echo "" >&2
+        echo "--- stderr ---" >&2
+        cat "$stderr_file" >&2 || true
+      fi
+      err "artifacts: $tmpdir"
+      return "$rc"
+    fi
+
+    local norm_json="$tmpdir/stdout.norm.json"
+    if ! jq -S . "$stdout_file" >"$norm_json" 2>"$tmpdir/jq_parse_err"; then
+      err "FAIL $task_id (stdout not valid JSON)"
+      cat "$tmpdir/jq_parse_err" >&2 || true
+      err "cmd: ${argv[*]}"
+      err "artifacts: $tmpdir"
+      return 1
+    fi
+
+    if [[ -n "$expects_jq" ]]; then
+      local jq_file
+      jq_file="$(require_relpath "$expects_jq")"
+      if ! jq -e -f "$jq_file" "$norm_json" >/dev/null 2>"$tmpdir/jq_assert_err"; then
+        err "FAIL $task_id (jq assert)"
+        cat "$tmpdir/jq_assert_err" >&2 || true
+        err "assert: $expects_jq"
+        err "artifacts: $tmpdir"
+        return 1
+      fi
+    fi
+
+    if [[ -n "$expects_golden" ]]; then
+      local golden_file golden_norm
+      golden_file="$(require_relpath "$expects_golden")"
+      golden_norm="$tmpdir/golden.norm.json"
+      if ! jq -S . "$golden_file" >"$golden_norm"; then
+        err "FAIL $task_id (golden not valid JSON)"
+        err "golden: $expects_golden"
+        err "artifacts: $tmpdir"
+        return 1
+      fi
+      if ! diff -u "$golden_norm" "$norm_json" >"$tmpdir/golden.diff"; then
+        err "FAIL $task_id (golden mismatch)"
+        cat "$tmpdir/golden.diff" >&2 || true
+        err "golden: $expects_golden"
+        err "artifacts: $tmpdir"
+        return 1
+      fi
+    fi
+
+    ok "OK $task_id"
+    rm -rf "$tmpdir"
+    return 0
+  fi
+
+  # Non-JSON task.
+  if [[ "$JSON_REPORT" == "1" ]]; then
+    if [[ "$stream" == "always" ]]; then
+      "${timeout_prefix[@]}" "${argv[@]}" 1>&2 || rc=$?
+    else
+      "${timeout_prefix[@]}" "${argv[@]}" >"$stdout_file" 2>"$stderr_file" || rc=$?
+    fi
+  else
+    if [[ "$stream" == "always" ]]; then
+      "${timeout_prefix[@]}" "${argv[@]}" || rc=$?
+    else
+      "${timeout_prefix[@]}" "${argv[@]}" >"$stdout_file" 2>"$stderr_file" || rc=$?
+    fi
+  fi
+
+  if [[ "$rc" != "0" ]]; then
+    err "FAIL $task_id (exit=$rc)"
+    err "cmd: ${argv[*]}"
+    if [[ -s "$stdout_file" ]]; then
+      echo "" >&2
+      echo "--- stdout ---" >&2
+      cat "$stdout_file" >&2 || true
+    fi
+    if [[ -s "$stderr_file" ]]; then
+      echo "" >&2
+      echo "--- stderr ---" >&2
+      cat "$stderr_file" >&2 || true
+    fi
+    err "artifacts: $tmpdir"
+    return "$rc"
+  fi
+
+  ok "OK $task_id"
+  rm -rf "$tmpdir"
+  return 0
+}
+
+for task_id in "${TASK_IDS[@]}"; do
+  [[ -n "$ONLY_TASK" && "$task_id" != "$ONLY_TASK" ]] && continue
+  if run_task "$task_id"; then
+    REPORT_LINES+=("${task_id}"$'\t'"1")
+  else
+    REPORT_LINES+=("${task_id}"$'\t'"0")
+    REPORT_OK=0
+    break
+  fi
+done
+
+FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+if [[ "$REPORT_OK" == "1" ]]; then
+  ok ""
+  ok "PASS bp $STAGE"
+else
+  err ""
+  err "FAIL bp $STAGE"
+fi
+
+if [[ "$JSON_REPORT" == "1" ]]; then
+  ok_json="false"
+  [[ "$REPORT_OK" == "1" ]] && ok_json="true"
+  printf '%s\n' "${REPORT_LINES[@]}" | jq -Rn \
+    --arg stage "$STAGE" \
+    --arg started_at "$STARTED_AT" \
+    --arg finished_at "$FINISHED_AT" \
+    --argjson ok "$ok_json" '
+      [inputs | split("\t") | {id: .[0], ok: (.[1] == "1")}] as $tasks
+      | {schema_version: 1, stage: $stage, ok: $ok, started_at: $started_at, finished_at: $finished_at, tasks: $tasks}
+    '
+fi
+
+[[ "$REPORT_OK" == "1" ]] && exit 0
+exit 1

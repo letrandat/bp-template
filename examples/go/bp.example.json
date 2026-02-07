@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "stages": {
+    "check": ["cli_example"],
+    "test": [],
+    "cli": ["cli_example"],
+    "e2e": []
+  },
+  "tasks": {
+    "cli_example": {
+      "desc": "example CLI: go JSON contract",
+      "cmd": ["go", "run", "examples/go/example_cli.go", "--json", "--stable", "--seed", "0"],
+      "timeout_ms": 20000,
+      "expects": {
+        "stdout": "json",
+        "jq": "examples/go/contracts/example.jq",
+        "golden": "examples/go/contracts/goldens/example.json"
+      }
+    }
+  }
+}
