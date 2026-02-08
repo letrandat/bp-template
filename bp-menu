@@ -35,8 +35,8 @@ pick_with_gum() {
 }
 
 pick_with_select() {
-  echo ""
-  echo "Pick:"
+  echo "" >&2
+  echo "Pick:" >&2
   options=(
     "Run: check"
     "Run: test"
@@ -48,7 +48,7 @@ pick_with_select() {
   )
   select opt in "${options[@]}"; do
     [[ -n "${opt:-}" ]] || { echo "invalid selection" >&2; continue; }
-    echo "$opt"
+    CHOICE="$opt"
     return 0
   done
 }
@@ -57,7 +57,8 @@ while true; do
   if command -v gum >/dev/null 2>&1; then
     CHOICE="$(pick_with_gum || true)"
   else
-    CHOICE="$(pick_with_select)"
+    CHOICE=""
+    pick_with_select
   fi
 
   case "$CHOICE" in
